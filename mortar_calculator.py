@@ -34,14 +34,6 @@ EXIT_HOTKEY = "<ctrl>+<f8>"
 # Measured from the supplied 1920x1080 screenshots.
 REF_MAP_RECT = (630.0, 208.0, 1290.0, 854.0)
 REF_TEAM_RECT = (15.0, 80.0, 620.0, 300.0)
-REF_SCOPE_ANCHORS = (
-    (430.0, 669.5),
-    (470.0, 567.0),
-    (510.0, 465.0),
-    (545.0, 363.5),
-)
-GUIDE_MIN_RANGE_M = 400
-GUIDE_MAX_RANGE_M = 550
 TEAM_WATCH_INTERVAL_SECONDS = 0.45
 TEAM_OCR_RETRY_SECONDS = 0.8
 
@@ -193,14 +185,6 @@ class MortarSession:
             self._last_result = result
 
 
-@dataclass(frozen=True)
-class GuideTick:
-    range_m: int
-    y: float
-    kind: str
-    highlighted: bool
-
-
 def parse_coordinate_texts(texts: Iterable[str]) -> MapPoint:
     """Parse x/y coordinate labels from OCR output."""
 
@@ -240,50 +224,6 @@ def calculate_distance_m(mortar: MapPoint, target: MapPoint) -> float:
 
 def round_to_nearest_five(distance_m: float) -> int:
     return int(math.floor(distance_m / 5.0 + 0.5) * 5)
-
-
-def range_to_scope_y(range_m: float, screen_height: int = REFERENCE_HEIGHT) -> float:
-    """Map a range to the sight ladder using piecewise linear calibration."""
-
-    anchors = REF_SCOPE_ANCHORS
-    if range_m <= anchors[0][0]:
-        lower, upper = anchors[0], anchors[1]
-    elif range_m >= anchors[-1][0]:
-        lower, upper = anchors[-2], anchors[-1]
-    else:
-        lower, upper = anchors[0], anchors[1]
-        for start, finish in zip(anchors, anchors[1:]):
-            if start[0] <= range_m <= finish[0]:
-                lower, upper = start, finish
-                break
-
-    fraction = (range_m - lower[0]) / (upper[0] - lower[0])
-    reference_y = lower[1] + fraction * (upper[1] - lower[1])
-    return reference_y * screen_height / REFERENCE_HEIGHT
-
-
-def build_guide_ticks(
-    target_distance_m: float,
-    screen_height: int = REFERENCE_HEIGHT,
-) -> list[GuideTick]:
-    highlighted_range = round_to_nearest_five(target_distance_m)
-    ticks: list[GuideTick] = []
-    for range_m in range(GUIDE_MIN_RANGE_M, GUIDE_MAX_RANGE_M + 1, 5):
-        if range_m % 50 == 0:
-            kind = "major"
-        elif range_m % 25 == 0:
-            kind = "medium"
-        else:
-            kind = "minor"
-        ticks.append(
-            GuideTick(
-                range_m=range_m,
-                y=range_to_scope_y(range_m, screen_height),
-                kind=kind,
-                highlighted=range_m == highlighted_range,
-            )
-        )
-    return ticks
 
 
 def is_mortar_scope(frame: np.ndarray) -> bool:
@@ -654,18 +594,6 @@ class RangeOverlay:
             ex_style | ws_ex_transparent | ws_ex_toolwindow | ws_ex_noactivate,
         )
 
-    def show_result(self, result: CalculationResult) -> None:
-        self.range_label.configure(
-            text=f"RANGE  {result.rounded_distance_m} m", fg="#72ff72"
-        )
-        self.detail_label.configure(
-            text=(
-                f"Mortar {result.mortar.x:.2f}, {result.mortar.y:.2f}   "
-                f"Target {result.target.x:.2f}, {result.target.y:.2f}"
-            )
-        )
-        self._show(3200)
-
     def show_mortar_saved(self, mortar: MapPoint) -> None:
         self.range_label.configure(text="MORTAR SAVED", fg="#72ff72")
         self.detail_label.configure(text=f"X={mortar.x:.2f}, Y={mortar.y:.2f}")
@@ -711,8 +639,8 @@ class RangeOverlay:
         self._hide_after = self.root.after(duration_ms, self.window.withdraw)
 
 
-class SightGuideOverlay:
-    """Transparent, click-through 5 m guide shown over the mortar scope."""
+class ScopeRangeOverlay:
+    """Small click-through range readout shown beneath the money display."""
 
     TRANSPARENT_COLOR = "#010203"
 
@@ -764,87 +692,34 @@ class SightGuideOverlay:
             self.window.withdraw()
             return
 
-        width = self.root.winfo_screenwidth()
-        height = self.root.winfo_screenheight()
-        scale_x = width / REFERENCE_WIDTH
-        self.window.geometry(f"{width}x{height}+0+0")
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        scale_x = screen_width / REFERENCE_WIDTH
+        scale_y = screen_height / REFERENCE_HEIGHT
+        width = max(115, round(145 * scale_x))
+        height = max(26, round(32 * scale_y))
+        x = screen_width - width - round(48 * scale_x)
+        y = round(52 * scale_y)
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
         self.canvas.configure(width=width, height=height)
         self.canvas.delete("all")
 
-        axis_x = 670.0 * scale_x
-        ticks = build_guide_ticks(self._target_distance_m, height)
-        visible_y = [tick.y for tick in ticks]
-        self.canvas.create_line(
-            axis_x,
-            min(visible_y),
-            axis_x,
-            max(visible_y),
-            fill="#7bdcf6",
-            width=1,
+        text = f"{round_to_nearest_five(self._target_distance_m)} m"
+        font_size = max(10, round(13 * min(scale_x, scale_y)))
+        self.canvas.create_text(
+            width / 2 + 1,
+            height / 2 + 1,
+            text=text,
+            fill="#000000",
+            font=("Segoe UI", font_size, "bold"),
         )
-
-        for tick in ticks:
-            if tick.kind == "major":
-                half_length = 42.0 * scale_x
-                color = "#b6efff"
-                line_width = 2
-            elif tick.kind == "medium":
-                half_length = 28.0 * scale_x
-                color = "#8edff5"
-                line_width = 2
-            else:
-                half_length = 17.0 * scale_x
-                color = "#72c7dc"
-                line_width = 1
-
-            self.canvas.create_line(
-                axis_x - half_length,
-                tick.y,
-                axis_x + half_length,
-                tick.y,
-                fill=color,
-                width=line_width,
-            )
-            if tick.kind == "major":
-                self.canvas.create_text(
-                    axis_x - 75.0 * scale_x,
-                    tick.y,
-                    text=f"{tick.range_m} m",
-                    anchor="e",
-                    fill="#d9f7ff",
-                    font=("Segoe UI", max(9, round(11 * scale_x)), "bold"),
-                )
-
-            if tick.highlighted:
-                self.canvas.create_line(
-                    650.0 * scale_x,
-                    tick.y,
-                    1270.0 * scale_x,
-                    tick.y,
-                    fill="#ffd84d",
-                    width=max(2, round(3 * scale_x)),
-                )
-                self.canvas.create_text(
-                    1282.0 * scale_x,
-                    tick.y,
-                    text=f"TARGET {tick.range_m} m",
-                    anchor="w",
-                    fill="#ffd84d",
-                    font=("Segoe UI", max(10, round(13 * scale_x)), "bold"),
-                )
-
-        rounded_target = round_to_nearest_five(self._target_distance_m)
-        if not (GUIDE_MIN_RANGE_M <= rounded_target <= GUIDE_MAX_RANGE_M):
-            self.canvas.create_text(
-                width / 2,
-                85.0 * height / REFERENCE_HEIGHT,
-                text=(
-                    f"Target {rounded_target} m is outside the "
-                    f"{GUIDE_MIN_RANGE_M}-{GUIDE_MAX_RANGE_M} m sight guide"
-                ),
-                fill="#ffd84d",
-                font=("Segoe UI", max(10, round(13 * scale_x)), "bold"),
-            )
+        self.canvas.create_text(
+            width / 2,
+            height / 2,
+            text=text,
+            fill="#ffe57a",
+            font=("Segoe UI", font_size, "bold"),
+        )
 
         self.window.deiconify()
         if os.name == "nt":
@@ -852,8 +727,8 @@ class SightGuideOverlay:
             ctypes.windll.user32.SetWindowPos(
                 hwnd,
                 -1,
-                0,
-                0,
+                x,
+                y,
                 width,
                 height,
                 0x0010 | 0x0040,
@@ -869,7 +744,7 @@ def run_live(ocr_engine: Any) -> None:
         ) from exc
 
     overlay = RangeOverlay()
-    sight_guide = SightGuideOverlay(overlay.root)
+    scope_range = ScopeRangeOverlay(overlay.root)
     messages: queue.Queue[tuple[str, Any]] = queue.Queue()
     session = MortarSession()
     target_busy = threading.Event()
@@ -959,25 +834,24 @@ def run_live(ocr_engine: Any) -> None:
             while True:
                 kind, payload = messages.get_nowait()
                 if kind == "armed":
-                    sight_guide.set_target_distance(None)
+                    scope_range.set_target_distance(None)
                     overlay.show_team_watch_armed()
                     print("TEAM watcher re-armed. Mark the new mortar location.")
                 elif kind == "mortar":
-                    sight_guide.set_target_distance(None)
+                    scope_range.set_target_distance(None)
                     overlay.show_mortar_saved(payload)
                     print(
                         f"Mortar saved: X={payload.x:.2f}, Y={payload.y:.2f}"
                     )
                 elif kind == "result":
-                    overlay.show_result(payload)
                     print(
                         f"Range {payload.rounded_distance_m} m | "
                         f"mortar=({payload.mortar.x:.2f}, {payload.mortar.y:.2f}) "
                         f"target=({payload.target.x:.2f}, {payload.target.y:.2f})"
                     )
-                    sight_guide.set_target_distance(payload.distance_m)
+                    scope_range.set_target_distance(payload.distance_m)
                 elif kind == "scope":
-                    sight_guide.set_scope_visible(bool(payload))
+                    scope_range.set_scope_visible(bool(payload))
                 elif kind == "error":
                     overlay.show_error(payload)
                     print(f"Could not calculate: {payload}", file=sys.stderr)
@@ -996,7 +870,7 @@ def run_live(ocr_engine: Any) -> None:
     print("Mark the mortar coordinate; the TEAM line saves automatically.")
     print("Press F7 first only when replacing a previously saved mortar.")
     print("Then point at a map target and press F8 for the range.")
-    print("The 5 m sight guide appears automatically in the mortar scope.")
+    print("The nearest 5 m range appears under the money in the mortar scope.")
     print("Press Ctrl+F8 to quit.")
     overlay.show_team_watch_armed()
     try:

@@ -73,27 +73,6 @@ def test_rounds_to_nearest_five_metres() -> None:
     assert mortar.round_to_nearest_five(417.5) == 420
 
 
-def test_range_ladder_interpolates_and_extrapolates() -> None:
-    assert mortar.range_to_scope_y(430) == pytest.approx(669.5)
-    assert mortar.range_to_scope_y(470) == pytest.approx(567.0)
-    assert mortar.range_to_scope_y(510) == pytest.approx(465.0)
-    assert mortar.range_to_scope_y(545) == pytest.approx(363.5)
-    assert mortar.range_to_scope_y(400) == pytest.approx(746.375)
-    assert mortar.range_to_scope_y(550) == pytest.approx(349.0)
-
-
-def test_guide_tick_hierarchy_and_target_highlight() -> None:
-    ticks = mortar.build_guide_ticks(413.0)
-    by_range = {tick.range_m: tick for tick in ticks}
-
-    assert len(ticks) == 31
-    assert by_range[400].kind == "major"
-    assert by_range[425].kind == "medium"
-    assert by_range[405].kind == "minor"
-    assert by_range[415].highlighted
-    assert sum(tick.highlighted for tick in ticks) == 1
-
-
 def test_detects_mortar_scope_only(
     scope_frame: np.ndarray, team_frame: np.ndarray
 ) -> None:

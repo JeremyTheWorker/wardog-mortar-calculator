@@ -1,16 +1,15 @@
 # War Dog Mortar Distance Calculator
 
 This Windows utility automatically saves a visible TEAM mortar coordinate,
-calculates the distance to the map coordinates under your mouse, and adds a
-5-meter guide to the mortar scope. It does not click, press keys, read game
-memory, or aim the mortar.
+calculates the distance to the map coordinates under your mouse, and shows the
+nearest 5-meter range beneath the money display in the mortar scope. It does
+not click, press keys, read game memory, or aim the mortar.
 
-The screen regions and sight guide are calibrated for the 1920x1080 layout
+The screen regions and scope display are calibrated for the 1920x1080 layout
 shown in `206376~1.JPG` and `2067AB~1.JPG`. Coordinates may be anywhere on the
 map. One coordinate unit is treated as 100 meters.
 
 ![TEAM mortar and map-target coordinate example](206376~1.JPG)
-![5-meter mortar sight guide preview](guide_preview.jpg)
 
 ## Run it
 
@@ -23,24 +22,13 @@ map. One coordinate unit is treated as 100 meters.
 5. Open the map and point at the location you want to hit. Keep the pointer
    still so the map's `x##.##` and `y##.##` labels are visible.
 6. Press **F8**.
-7. Enter the mortar scope. The guide appears automatically and hides when you
-   leave the scope.
+7. Enter the mortar scope. A small range rounded to the nearest 5 m appears
+   beneath the money display and hides when you leave the scope.
 
 A small overlay will show `RANGE ### m` for a few seconds. The console also
 prints the mortar and target coordinates. You can press F8 for more targets;
 if the mortar moves, press **F7 before marking it again** to re-arm automatic
 TEAM-coordinate capture. Press **Ctrl+F8** to stop.
-
-## Sight guide
-
-- Small ticks mark every **5 m**.
-- Longer ticks mark every **25 m**.
-- Numbered ticks mark every **50 m**.
-- The calculated target is rounded to the nearest 5 m and highlighted in
-  yellow.
-- The calibrated guide covers **400–550 m**. Ranges outside that window still
-  appear numerically, but the calculator does not draw an untrusted target
-  line.
 
 The `206376~1.JPG` screenshot gives:
 
@@ -82,8 +70,8 @@ label. The debug image marks the two screen regions used for OCR.
   the old position and re-arms the watcher.
 - **Could not read target X/Y:** Keep the full map open and let both pointer
   coordinate labels appear before pressing F8.
-- **Sight guide does not appear:** Calculate a target with F8 first, then enter
-  the full mortar scope. The guide only supports the calibrated 1920x1080 UI.
+- **Scope range does not appear:** Calculate a target with F8 first, then enter
+  the full mortar scope. The display only supports the calibrated 1920x1080 UI.
 - **Overlay is hidden behind the game:** Use borderless-windowed display mode.
   The calculated range is still printed in the console.
 - **Different resolution or UI layout:** The OCR regions will need to be
