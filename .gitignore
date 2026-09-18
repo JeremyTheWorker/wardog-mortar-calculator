@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+mortar_debug.*
+202609181449*.jpg
