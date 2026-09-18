@@ -15,6 +15,7 @@ import mortar_calculator as mortar  # noqa: E402
 
 
 TEAM_SCREENSHOT = PROJECT_ROOT / "206376~1.JPG"
+SCOPE_SCREENSHOT = PROJECT_ROOT / "2067AB~1.JPG"
 
 
 @pytest.fixture(scope="module")
@@ -25,8 +26,27 @@ def team_frame() -> np.ndarray:
 
 
 @pytest.fixture(scope="module")
+def scope_frame() -> np.ndarray:
+    frame = cv2.imread(str(SCOPE_SCREENSHOT))
+    assert frame is not None
+    return frame
+
+
+@pytest.fixture(scope="module")
 def ocr_engine():
     return mortar.create_ocr_engine()
+
+
+@pytest.fixture(scope="module")
+def read_team_result(team_frame: np.ndarray, ocr_engine):
+    layout = mortar.ScreenLayout.from_frame(team_frame)
+    return mortar.read_team_mortar_coordinates(team_frame, layout, ocr_engine)
+
+
+@pytest.fixture(scope="module")
+def read_target_result(team_frame: np.ndarray, ocr_engine):
+    layout = mortar.ScreenLayout.from_frame(team_frame)
+    return mortar.read_target_coordinates(team_frame, layout, ocr_engine)
 
 
 def test_parse_coordinate_texts() -> None:
@@ -45,6 +65,40 @@ def test_distance_uses_100_m_grid_squares() -> None:
     assert mortar.calculate_distance_m(mortar_position, target) == pytest.approx(
         500.0
     )
+
+
+def test_rounds_to_nearest_five_metres() -> None:
+    assert mortar.round_to_nearest_five(412.4) == 410
+    assert mortar.round_to_nearest_five(412.5) == 415
+    assert mortar.round_to_nearest_five(417.5) == 420
+
+
+def test_range_ladder_interpolates_and_extrapolates() -> None:
+    assert mortar.range_to_scope_y(430) == pytest.approx(669.5)
+    assert mortar.range_to_scope_y(470) == pytest.approx(567.0)
+    assert mortar.range_to_scope_y(510) == pytest.approx(465.0)
+    assert mortar.range_to_scope_y(545) == pytest.approx(363.5)
+    assert mortar.range_to_scope_y(400) == pytest.approx(746.375)
+    assert mortar.range_to_scope_y(550) == pytest.approx(349.0)
+
+
+def test_guide_tick_hierarchy_and_target_highlight() -> None:
+    ticks = mortar.build_guide_ticks(413.0)
+    by_range = {tick.range_m: tick for tick in ticks}
+
+    assert len(ticks) == 31
+    assert by_range[400].kind == "major"
+    assert by_range[425].kind == "medium"
+    assert by_range[405].kind == "minor"
+    assert by_range[415].highlighted
+    assert sum(tick.highlighted for tick in ticks) == 1
+
+
+def test_detects_mortar_scope_only(
+    scope_frame: np.ndarray, team_frame: np.ndarray
+) -> None:
+    assert mortar.is_mortar_scope(scope_frame)
+    assert not mortar.is_mortar_scope(team_frame)
 
 
 def test_newest_team_row_is_selected() -> None:
@@ -66,12 +120,9 @@ def test_coordinate_without_team_label_is_rejected() -> None:
 
 
 def test_reads_team_mortar_coordinate(
-    team_frame: np.ndarray, ocr_engine
+    read_team_result,
 ) -> None:
-    layout = mortar.ScreenLayout.from_frame(team_frame)
-    point, recognized_text = mortar.read_team_mortar_coordinates(
-        team_frame, layout, ocr_engine
-    )
+    point, recognized_text = read_team_result
 
     assert point == mortar.MapPoint(x=98.59, y=109.82)
     assert "TEAM" in recognized_text
@@ -79,12 +130,9 @@ def test_reads_team_mortar_coordinate(
 
 
 def test_reads_mouse_target_coordinate(
-    team_frame: np.ndarray, ocr_engine
+    read_target_result,
 ) -> None:
-    layout = mortar.ScreenLayout.from_frame(team_frame)
-    target, recognized_text = mortar.read_target_coordinates(
-        team_frame, layout, ocr_engine
-    )
+    target, recognized_text = read_target_result
 
     assert target == mortar.MapPoint(x=98.17, y=109.88)
     assert "y109.88" in recognized_text
@@ -92,20 +140,33 @@ def test_reads_mouse_target_coordinate(
 
 
 def test_team_screenshot_calculates_42_m(
-    team_frame: np.ndarray, ocr_engine
+    read_team_result, read_target_result
 ) -> None:
-    layout = mortar.ScreenLayout.from_frame(team_frame)
-    mortar_position, _ = mortar.read_team_mortar_coordinates(
-        team_frame, layout, ocr_engine
-    )
-    result = mortar.analyze_target_frame(team_frame, mortar_position, ocr_engine)
+    mortar_position, _ = read_team_result
+    target, _ = read_target_result
+    distance = mortar.calculate_distance_m(mortar_position, target)
 
-    assert result.mortar == mortar.MapPoint(x=98.59, y=109.82)
-    assert result.target == mortar.MapPoint(x=98.17, y=109.88)
-    assert result.distance_m == pytest.approx(42.4264, abs=0.001)
-    assert result.rounded_distance_m == 42
+    assert distance == pytest.approx(42.4264, abs=0.001)
+    assert round(distance) == 42
 
 
-def test_f8_requires_a_saved_f7_mortar_position() -> None:
-    with pytest.raises(mortar.CalculatorError, match="press F7 first"):
+def test_session_locks_first_team_coordinate_until_rearmed() -> None:
+    session = mortar.MortarSession()
+    first = mortar.MapPoint(98.59, 109.82)
+    ignored = mortar.MapPoint(10.0, 20.0)
+
+    assert session.save_mortar_if_armed(first)
+    assert not session.save_mortar_if_armed(ignored)
+    assert session.snapshot().mortar == first
+    assert not session.snapshot().team_watch_armed
+
+    session.rearm_team_watch()
+    assert session.snapshot().mortar is None
+    assert session.snapshot().team_watch_armed
+    assert session.save_mortar_if_armed(ignored)
+    assert session.snapshot().mortar == ignored
+
+
+def test_f8_requires_an_automatically_saved_mortar_position() -> None:
+    with pytest.raises(mortar.CalculatorError, match="No mortar position"):
         mortar.require_saved_mortar(None)

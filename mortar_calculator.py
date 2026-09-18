@@ -15,6 +15,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -33,6 +34,16 @@ EXIT_HOTKEY = "<ctrl>+<f8>"
 # Measured from the supplied 1920x1080 screenshots.
 REF_MAP_RECT = (630.0, 208.0, 1290.0, 854.0)
 REF_TEAM_RECT = (15.0, 80.0, 620.0, 300.0)
+REF_SCOPE_ANCHORS = (
+    (430.0, 669.5),
+    (470.0, 567.0),
+    (510.0, 465.0),
+    (545.0, 363.5),
+)
+GUIDE_MIN_RANGE_M = 400
+GUIDE_MAX_RANGE_M = 550
+TEAM_WATCH_INTERVAL_SECONDS = 0.45
+TEAM_OCR_RETRY_SECONDS = 0.8
 
 COORDINATE_PATTERN = re.compile(
     r"(?P<axis>[xy])\s*[:=]?\s*(?P<value>-?\d{1,3}(?:[.,]\d{1,3})?)",
@@ -134,6 +145,62 @@ class CalculationResult:
         return round(self.distance_m)
 
 
+@dataclass(frozen=True)
+class SessionSnapshot:
+    mortar: MapPoint | None
+    last_result: CalculationResult | None
+    team_watch_armed: bool
+
+
+class MortarSession:
+    """Thread-safe live state shared by hotkeys and the screen watcher."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._mortar: MapPoint | None = None
+        self._last_result: CalculationResult | None = None
+        self._team_watch_armed = True
+
+    def snapshot(self) -> SessionSnapshot:
+        with self._lock:
+            return SessionSnapshot(
+                mortar=self._mortar,
+                last_result=self._last_result,
+                team_watch_armed=self._team_watch_armed,
+            )
+
+    def save_mortar_if_armed(self, mortar: MapPoint) -> bool:
+        with self._lock:
+            if not self._team_watch_armed:
+                return False
+            self._mortar = mortar
+            self._last_result = None
+            self._team_watch_armed = False
+            return True
+
+    def rearm_team_watch(self) -> None:
+        with self._lock:
+            self._mortar = None
+            self._last_result = None
+            self._team_watch_armed = True
+
+    def require_mortar(self) -> MapPoint:
+        with self._lock:
+            return require_saved_mortar(self._mortar)
+
+    def save_result(self, result: CalculationResult) -> None:
+        with self._lock:
+            self._last_result = result
+
+
+@dataclass(frozen=True)
+class GuideTick:
+    range_m: int
+    y: float
+    kind: str
+    highlighted: bool
+
+
 def parse_coordinate_texts(texts: Iterable[str]) -> MapPoint:
     """Parse x/y coordinate labels from OCR output."""
 
@@ -169,6 +236,86 @@ def calculate_distance_m(mortar: MapPoint, target: MapPoint) -> float:
     """Return map-grid Euclidean distance in meters."""
 
     return GRID_METERS * math.hypot(target.x - mortar.x, target.y - mortar.y)
+
+
+def round_to_nearest_five(distance_m: float) -> int:
+    return int(math.floor(distance_m / 5.0 + 0.5) * 5)
+
+
+def range_to_scope_y(range_m: float, screen_height: int = REFERENCE_HEIGHT) -> float:
+    """Map a range to the sight ladder using piecewise linear calibration."""
+
+    anchors = REF_SCOPE_ANCHORS
+    if range_m <= anchors[0][0]:
+        lower, upper = anchors[0], anchors[1]
+    elif range_m >= anchors[-1][0]:
+        lower, upper = anchors[-2], anchors[-1]
+    else:
+        lower, upper = anchors[0], anchors[1]
+        for start, finish in zip(anchors, anchors[1:]):
+            if start[0] <= range_m <= finish[0]:
+                lower, upper = start, finish
+                break
+
+    fraction = (range_m - lower[0]) / (upper[0] - lower[0])
+    reference_y = lower[1] + fraction * (upper[1] - lower[1])
+    return reference_y * screen_height / REFERENCE_HEIGHT
+
+
+def build_guide_ticks(
+    target_distance_m: float,
+    screen_height: int = REFERENCE_HEIGHT,
+) -> list[GuideTick]:
+    highlighted_range = round_to_nearest_five(target_distance_m)
+    ticks: list[GuideTick] = []
+    for range_m in range(GUIDE_MIN_RANGE_M, GUIDE_MAX_RANGE_M + 1, 5):
+        if range_m % 50 == 0:
+            kind = "major"
+        elif range_m % 25 == 0:
+            kind = "medium"
+        else:
+            kind = "minor"
+        ticks.append(
+            GuideTick(
+                range_m=range_m,
+                y=range_to_scope_y(range_m, screen_height),
+                kind=kind,
+                highlighted=range_m == highlighted_range,
+            )
+        )
+    return ticks
+
+
+def is_mortar_scope(frame: np.ndarray) -> bool:
+    """Detect the dark circular mortar sight without OCR."""
+
+    try:
+        layout = ScreenLayout.from_frame(frame)
+    except CalculatorError:
+        return False
+
+    def reference_crop(values: Sequence[float]) -> np.ndarray:
+        left, top, right, bottom = values
+        return frame[
+            round(top * layout.scale_y) : round(bottom * layout.scale_y),
+            round(left * layout.scale_x) : round(right * layout.scale_x),
+        ]
+
+    top_left = reference_crop((20.0, 40.0, 250.0, 170.0))
+    top_right = reference_crop((1670.0, 50.0, 1900.0, 180.0))
+    center = reference_crop((750.0, 250.0, 1170.0, 800.0))
+    if top_left.size == 0 or top_right.size == 0 or center.size == 0:
+        return False
+
+    def black_fraction(image: np.ndarray) -> float:
+        return float((image.max(axis=2) < 20).mean())
+
+    return (
+        black_fraction(top_left) >= 0.92
+        and black_fraction(top_right) >= 0.92
+        and black_fraction(center) <= 0.35
+        and float(center.mean()) >= 15.0
+    )
 
 
 def create_ocr_engine() -> Any:
@@ -337,8 +484,8 @@ def read_team_mortar_coordinates(
 def require_saved_mortar(mortar: MapPoint | None) -> MapPoint:
     if mortar is None:
         raise CalculatorError(
-            "No mortar position is saved. Show the TEAM coordinate and press "
-            "F7 first."
+            "No mortar position is saved. Mark the mortar coordinate and wait "
+            "for the automatic confirmation; press F7 first only when re-arming."
         )
     return mortar
 
@@ -524,6 +671,13 @@ class RangeOverlay:
         self.detail_label.configure(text=f"X={mortar.x:.2f}, Y={mortar.y:.2f}")
         self._show(3200)
 
+    def show_team_watch_armed(self) -> None:
+        self.range_label.configure(text="WAITING FOR TEAM COORD", fg="#72d8ff")
+        self.detail_label.configure(
+            text="Mark the mortar position; it will save automatically."
+        )
+        self._show(3600)
+
     def show_error(self, message: str) -> None:
         self.range_label.configure(text="NO RANGE", fg="#ff6b6b")
         self.detail_label.configure(text=message)
@@ -557,6 +711,155 @@ class RangeOverlay:
         self._hide_after = self.root.after(duration_ms, self.window.withdraw)
 
 
+class SightGuideOverlay:
+    """Transparent, click-through 5 m guide shown over the mortar scope."""
+
+    TRANSPARENT_COLOR = "#010203"
+
+    def __init__(self, root: Any) -> None:
+        import tkinter as tk
+
+        self.root = root
+        self.window = tk.Toplevel(root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.configure(bg=self.TRANSPARENT_COLOR)
+        self.window.wm_attributes("-transparentcolor", self.TRANSPARENT_COLOR)
+        self.canvas = tk.Canvas(
+            self.window,
+            bg=self.TRANSPARENT_COLOR,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self._scope_visible = False
+        self._target_distance_m: float | None = None
+        self.window.update_idletasks()
+        self._configure_no_activate()
+
+    def _configure_no_activate(self) -> None:
+        if os.name != "nt":
+            return
+        hwnd = self.window.winfo_id()
+        ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        ctypes.windll.user32.SetWindowLongW(
+            hwnd,
+            -20,
+            ex_style | 0x00000020 | 0x00000080 | 0x08000000,
+        )
+
+    def set_target_distance(self, distance_m: float | None) -> None:
+        self._target_distance_m = distance_m
+        self._refresh()
+
+    def set_scope_visible(self, visible: bool) -> None:
+        if self._scope_visible == visible:
+            return
+        self._scope_visible = visible
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if not self._scope_visible or self._target_distance_m is None:
+            self.window.withdraw()
+            return
+
+        width = self.root.winfo_screenwidth()
+        height = self.root.winfo_screenheight()
+        scale_x = width / REFERENCE_WIDTH
+        self.window.geometry(f"{width}x{height}+0+0")
+        self.canvas.configure(width=width, height=height)
+        self.canvas.delete("all")
+
+        axis_x = 670.0 * scale_x
+        ticks = build_guide_ticks(self._target_distance_m, height)
+        visible_y = [tick.y for tick in ticks]
+        self.canvas.create_line(
+            axis_x,
+            min(visible_y),
+            axis_x,
+            max(visible_y),
+            fill="#7bdcf6",
+            width=1,
+        )
+
+        for tick in ticks:
+            if tick.kind == "major":
+                half_length = 42.0 * scale_x
+                color = "#b6efff"
+                line_width = 2
+            elif tick.kind == "medium":
+                half_length = 28.0 * scale_x
+                color = "#8edff5"
+                line_width = 2
+            else:
+                half_length = 17.0 * scale_x
+                color = "#72c7dc"
+                line_width = 1
+
+            self.canvas.create_line(
+                axis_x - half_length,
+                tick.y,
+                axis_x + half_length,
+                tick.y,
+                fill=color,
+                width=line_width,
+            )
+            if tick.kind == "major":
+                self.canvas.create_text(
+                    axis_x - 75.0 * scale_x,
+                    tick.y,
+                    text=f"{tick.range_m} m",
+                    anchor="e",
+                    fill="#d9f7ff",
+                    font=("Segoe UI", max(9, round(11 * scale_x)), "bold"),
+                )
+
+            if tick.highlighted:
+                self.canvas.create_line(
+                    650.0 * scale_x,
+                    tick.y,
+                    1270.0 * scale_x,
+                    tick.y,
+                    fill="#ffd84d",
+                    width=max(2, round(3 * scale_x)),
+                )
+                self.canvas.create_text(
+                    1282.0 * scale_x,
+                    tick.y,
+                    text=f"TARGET {tick.range_m} m",
+                    anchor="w",
+                    fill="#ffd84d",
+                    font=("Segoe UI", max(10, round(13 * scale_x)), "bold"),
+                )
+
+        rounded_target = round_to_nearest_five(self._target_distance_m)
+        if not (GUIDE_MIN_RANGE_M <= rounded_target <= GUIDE_MAX_RANGE_M):
+            self.canvas.create_text(
+                width / 2,
+                85.0 * height / REFERENCE_HEIGHT,
+                text=(
+                    f"Target {rounded_target} m is outside the "
+                    f"{GUIDE_MIN_RANGE_M}-{GUIDE_MAX_RANGE_M} m sight guide"
+                ),
+                fill="#ffd84d",
+                font=("Segoe UI", max(10, round(13 * scale_x)), "bold"),
+            )
+
+        self.window.deiconify()
+        if os.name == "nt":
+            hwnd = self.window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                -1,
+                0,
+                0,
+                width,
+                height,
+                0x0010 | 0x0040,
+            )
+
+
 def run_live(ocr_engine: Any) -> None:
     try:
         from pynput import keyboard
@@ -566,52 +869,76 @@ def run_live(ocr_engine: Any) -> None:
         ) from exc
 
     overlay = RangeOverlay()
+    sight_guide = SightGuideOverlay(overlay.root)
     messages: queue.Queue[tuple[str, Any]] = queue.Queue()
-    busy = threading.Event()
-    state_lock = threading.Lock()
-    mortar_position: MapPoint | None = None
-
-    def save_mortar_once() -> None:
-        nonlocal mortar_position
-        try:
-            frame = capture_monitor_under_cursor()
-            layout = ScreenLayout.from_frame(frame)
-            mortar, _ = read_team_mortar_coordinates(frame, layout, ocr_engine)
-            with state_lock:
-                mortar_position = mortar
-            messages.put(("mortar", mortar))
-        except CalculatorError as exc:
-            messages.put(("error", str(exc)))
-        except Exception as exc:  # Keep the hotkey listener alive after a failure.
-            messages.put(("error", f"Unexpected error: {exc}"))
-        finally:
-            busy.clear()
+    session = MortarSession()
+    target_busy = threading.Event()
+    ocr_lock = threading.Lock()
+    stop_event = threading.Event()
 
     def calculate_once() -> None:
         try:
-            with state_lock:
-                saved_mortar = require_saved_mortar(mortar_position)
+            saved_mortar = session.require_mortar()
             frame = capture_monitor_under_cursor()
-            result = analyze_target_frame(frame, saved_mortar, ocr_engine)
+            with ocr_lock:
+                result = analyze_target_frame(frame, saved_mortar, ocr_engine)
+            session.save_result(result)
             messages.put(("result", result))
         except CalculatorError as exc:
             messages.put(("error", str(exc)))
         except Exception as exc:  # Keep the hotkey listener alive after a failure.
             messages.put(("error", f"Unexpected error: {exc}"))
         finally:
-            busy.clear()
+            target_busy.clear()
 
-    def start_worker(worker: Any) -> None:
-        if busy.is_set():
-            return
-        busy.set()
-        threading.Thread(target=worker, daemon=True).start()
+    def monitor_screen() -> None:
+        last_scope_state: bool | None = None
+        next_team_ocr_at = 0.0
+        while not stop_event.is_set():
+            try:
+                frame = capture_monitor_under_cursor()
+                scope_state = is_mortar_scope(frame)
+                if scope_state != last_scope_state:
+                    messages.put(("scope", scope_state))
+                    last_scope_state = scope_state
+
+                snapshot = session.snapshot()
+                now = time.monotonic()
+                if (
+                    snapshot.team_watch_armed
+                    and now >= next_team_ocr_at
+                    and ocr_lock.acquire(blocking=False)
+                ):
+                    try:
+                        layout = ScreenLayout.from_frame(frame)
+                        mortar, _ = read_team_mortar_coordinates(
+                            frame, layout, ocr_engine
+                        )
+                        if session.save_mortar_if_armed(mortar):
+                            messages.put(("mortar", mortar))
+                    except CalculatorError:
+                        pass
+                    except Exception as exc:
+                        messages.put(("watcher_error", str(exc)))
+                    finally:
+                        ocr_lock.release()
+                    next_team_ocr_at = now + TEAM_OCR_RETRY_SECONDS
+            except CalculatorError:
+                pass
+            except Exception as exc:
+                messages.put(("watcher_error", str(exc)))
+
+            stop_event.wait(TEAM_WATCH_INTERVAL_SECONDS)
 
     def on_set_mortar_hotkey() -> None:
-        start_worker(save_mortar_once)
+        session.rearm_team_watch()
+        messages.put(("armed", None))
 
     def on_target_hotkey() -> None:
-        start_worker(calculate_once)
+        if target_busy.is_set():
+            return
+        target_busy.set()
+        threading.Thread(target=calculate_once, daemon=True).start()
 
     def on_exit_hotkey() -> None:
         messages.put(("exit", None))
@@ -624,12 +951,19 @@ def run_live(ocr_engine: Any) -> None:
         }
     )
     listener.start()
+    watcher = threading.Thread(target=monitor_screen, daemon=True)
+    watcher.start()
 
     def poll_messages() -> None:
         try:
             while True:
                 kind, payload = messages.get_nowait()
-                if kind == "mortar":
+                if kind == "armed":
+                    sight_guide.set_target_distance(None)
+                    overlay.show_team_watch_armed()
+                    print("TEAM watcher re-armed. Mark the new mortar location.")
+                elif kind == "mortar":
+                    sight_guide.set_target_distance(None)
                     overlay.show_mortar_saved(payload)
                     print(
                         f"Mortar saved: X={payload.x:.2f}, Y={payload.y:.2f}"
@@ -641,10 +975,16 @@ def run_live(ocr_engine: Any) -> None:
                         f"mortar=({payload.mortar.x:.2f}, {payload.mortar.y:.2f}) "
                         f"target=({payload.target.x:.2f}, {payload.target.y:.2f})"
                     )
+                    sight_guide.set_target_distance(payload.distance_m)
+                elif kind == "scope":
+                    sight_guide.set_scope_visible(bool(payload))
                 elif kind == "error":
                     overlay.show_error(payload)
                     print(f"Could not calculate: {payload}", file=sys.stderr)
+                elif kind == "watcher_error":
+                    print(f"Screen watcher warning: {payload}", file=sys.stderr)
                 elif kind == "exit":
+                    stop_event.set()
                     overlay.root.quit()
                     return
         except queue.Empty:
@@ -653,14 +993,19 @@ def run_live(ocr_engine: Any) -> None:
 
     overlay.root.after(40, poll_messages)
     print("Mortar calculator ready.")
-    print("Show the TEAM mortar coordinate and press F7 to save it.")
+    print("Mark the mortar coordinate; the TEAM line saves automatically.")
+    print("Press F7 first only when replacing a previously saved mortar.")
     print("Then point at a map target and press F8 for the range.")
+    print("The 5 m sight guide appears automatically in the mortar scope.")
     print("Press Ctrl+F8 to quit.")
+    overlay.show_team_watch_armed()
     try:
         overlay.root.mainloop()
     finally:
+        stop_event.set()
         listener.stop()
         listener.join(timeout=1.0)
+        watcher.join(timeout=2.0)
         overlay.root.destroy()
 
 
